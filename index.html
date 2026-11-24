@@ -1729,14 +1729,18 @@ function setupNotes(){
 
 /* ============ DAILY BRIEFING ============ */
 /* Plays once a day by itself on the first visit. Browsers only allow sound after the first tap or key press,
-   so if the page opens silently the briefing starts at that first tap. */
+   so when the page has not been touched yet the briefing waits for that first tap. The day is only marked
+   as done once the voice has actually started. */
 const Brief = (function(){
-  let tts = null, ttsReady = false, lines = [], speaking = false, armed = null, stopping = false, startedCb = null, hideTimer = 0, autoDone = false;
+  let tts = null, ttsReady = false, lines = [], speaking = false, armed = null, stopping = false;
+  let startedCb = null, blockedCb = null, hideTimer = 0, pendingDay = null, pollTimer = 0;
   const card = () => $("#brief");
+  const DONE_KEY = "cwh.spokenDay";
   const spell = code => String(code).replace(/-/g, " ").split("").join(" ").replace(/\s+/g, " ").trim();
   const sayTime = h => h === 12 ? "12 noon" : h < 12 ? h + " a.m." : (h - 12) + " p.m.";
   const wait = (test, ms) => new Promise(res => { const t0 = Date.now(); (function tick(){ if (test() || Date.now() - t0 > ms) res(); else setTimeout(tick, 120); })(); });
   function init(){
+    if ("speechSynthesis" in window){ try { window.speechSynthesis.getVoices(); window.speechSynthesis.addEventListener("voiceschanged", () => {}); } catch(e) {} }
     const c = window.claude;
     if (!c || typeof c.use !== "function"){ ttsReady = true; return; }
     c.use("tts").then(t => {
@@ -1783,7 +1787,13 @@ const Brief = (function(){
     $("#brief-kick").textContent = "Daily briefing, " + fd(now.day, "full");
     $("#brief-lines").innerHTML = lines.map((l, i) => '<li id="bl-' + i + '"' + (l.cls ? ' class="' + l.cls + '"' : '') + (l.kv ? ' style="' + l.kv + '"' : '') + '>' + (l.kv ? '<i></i>' : '') + '<span>' + esc(l.text) + '</span></li>').join("");
   }
-  function started(){ if (startedCb){ const f = startedCb; startedCb = null; f(); } }
+  /* The voice is really playing: count today's briefing as done. */
+  function started(){
+    clearInterval(pollTimer);
+    if (pendingDay !== null){ markDone(pendingDay); pendingDay = null; disarm(); }
+    if (startedCb){ const f = startedCb; startedCb = null; blockedCb = null; f(); }
+  }
+  function blocked(){ if (blockedCb){ const f = blockedCb; blockedCb = null; startedCb = null; f(); } }
   function setSpeaking(on){
     speaking = on;
     card().classList.toggle("speaking", on);
@@ -1792,7 +1802,7 @@ const Brief = (function(){
     if (on){ card().classList.add("show"); $("#brief-hint").textContent = ""; }
     else {
       document.querySelectorAll("#brief-lines li.on").forEach(li => li.classList.remove("on"));
-      if (card().classList.contains("show")) hideTimer = setTimeout(() => card().classList.remove("show"), 8000);
+      if (card().classList.contains("show") && !$("#brief-hint").textContent) hideTimer = setTimeout(() => card().classList.remove("show"), 8000);
     }
   }
   function mark(id){
@@ -1801,14 +1811,21 @@ const Brief = (function(){
     if (li){ li.classList.add("on"); li.scrollIntoView({block: "nearest"}); }
   }
   const speechOK = () => "speechSynthesis" in window && typeof SpeechSynthesisUtterance === "function";
+  /* Voices installed on the device are the most reliable; online voices are used only if there is no local one. */
   function pickVoice(prefixes){
     const vs = window.speechSynthesis.getVoices() || [];
-    for (const pre of prefixes){ const v = vs.find(x => x.lang && x.lang.toLowerCase().replace("_", "-").startsWith(pre)); if (v) return v; }
+    for (const localOnly of [true, false]){
+      for (const pre of prefixes){
+        const v = vs.find(x => (!localOnly || x.localService) && x.lang && x.lang.toLowerCase().replace("_", "-").startsWith(pre));
+        if (v) return v;
+      }
+    }
     return null;
   }
   function browserSpeak(){
     const ss = window.speechSynthesis;
-    ss.cancel();
+    if (ss.speaking || ss.pending) ss.cancel();
+    try { ss.resume(); } catch(e) {}
     const en = pickVoice(["en-gb", "en-us", "en"]), ms = pickVoice(["ms", "id"]);
     const parts = [];
     lines.forEach((l, i) => {
@@ -1822,40 +1839,59 @@ const Brief = (function(){
       if (p.v){ u.voice = p.v; u.lang = p.v.lang; } else u.lang = "en-GB";
       u.rate = 0.95;
       u.onstart = () => { started(); setSpeaking(true); mark("bl-" + p.i); };
-      if (k === parts.length - 1){ u.onend = () => setSpeaking(false); u.onerror = () => setSpeaking(false); }
+      u.onerror = ev => {
+        if (ev && ev.error === "not-allowed") blocked();
+        if (k === parts.length - 1) setSpeaking(false);
+      };
+      if (k === parts.length - 1) u.onend = () => setSpeaking(false);
       ss.speak(u);
     });
+    clearInterval(pollTimer);
+    let n = 0;
+    pollTimer = setInterval(() => { n++; if (ss.speaking){ started(); setSpeaking(true); } if (n > 60) clearInterval(pollTimer); }, 250);
   }
-  /* Resolves true once the voice is actually heard, false if the browser held it back. */
-  function speak(){
+  /* Resolves "started", "blocked", "timeout" or "unsupported". A slow voice is never cut off. */
+  function speak(waitMs){
     render(nowMYT());
     stopping = false;
     return new Promise(resolve => {
       let settled = false;
-      const done = ok => { if (settled) return; settled = true; clearTimeout(timer); startedCb = null; if (!ok) quiet(); resolve(ok); };
-      const timer = setTimeout(() => done(false), 3500);
-      startedCb = () => done(true);
+      const done = r => { if (settled) return; settled = true; clearTimeout(timer); resolve(r); };
+      const timer = setTimeout(() => { startedCb = null; blockedCb = null; done("timeout"); }, waitMs || 10000);
+      startedCb = () => done("started");
+      blockedCb = () => done("blocked");
       if (tts){
         tts.speak(lines.map((l, i) => ({text: l.say, id: "bl-" + i, language: "en"})))
-          .then(() => { done(true); setSpeaking(false); })
+          .then(() => { started(); setSpeaking(false); })
           .catch(e => {
             if (e && e.code === "not_granted"){ tts = null; if (speechOK()) { browserSpeak(); return; } }
-            done(false); setSpeaking(false);
+            if (!stopping) blocked();
+            setSpeaking(false);
           });
       } else if (speechOK()) browserSpeak();
-      else done(false);
+      else { startedCb = null; blockedCb = null; done("unsupported"); }
     });
   }
-  function quiet(){
+  function stop(){
     stopping = true;
+    clearInterval(pollTimer);
     if (tts){ try { tts.stop(); } catch(e) {} }
     if (speechOK()){ try { window.speechSynthesis.cancel(); } catch(e) {} }
+    setSpeaking(false);
   }
-  function stop(){ quiet(); setSpeaking(false); }
+  function problem(r){
+    const msg = r === "unsupported" ? "This browser can't read text aloud, so here is today's briefing as text."
+      : r === "blocked" ? "Your browser blocked the sound. Tap Play briefing to hear it."
+      : "No sound came through. Check that your volume is up, then tap Play briefing.";
+    clearTimeout(hideTimer);
+    $("#brief-hint").textContent = msg;
+    $("#b-play").textContent = "Play briefing";
+    card().classList.add("show");
+    if (r === "unsupported" && pendingDay !== null){ markDone(pendingDay); pendingDay = null; }
+  }
   function markDone(day){
-    autoDone = true;
-    try { localStorage.setItem("cwh.briefDay", String(day)); } catch(e) {}
-    if (Store.mode() === "db" || Store.mode() === "local") Store.put("prefs", {kind: "prefs", briefDay: String(day)});
+    try { localStorage.setItem(DONE_KEY, String(day)); } catch(e) {}
+    if (Store.mode() === "db" || Store.mode() === "local") Store.put("prefs", {kind: "prefs", spokenDay: String(day)});
   }
   function disarm(){
     $("#briefchip").classList.remove("show");
@@ -1864,21 +1900,14 @@ const Brief = (function(){
     document.removeEventListener("keydown", armed, true);
     armed = null;
   }
-  function arm(day){
+  function arm(){
     disarm();
     $("#briefchip").classList.add("show");
     armed = e => {
       if (e.type === "keydown" && ["Escape", "Tab", "Shift", "Control", "Alt", "Meta"].includes(e.key)) return;
+      if (e.target && e.target.closest && e.target.closest("#b-play, #brief-open")) { disarm(); return; }
       disarm();
-      speak().then(ok => {
-        markDone(day);
-        if (!ok){
-          clearTimeout(hideTimer);
-          $("#b-play").textContent = "Try again";
-          $("#brief-hint").textContent = "The voice couldn't play in this browser, so here is today's briefing as text.";
-          card().classList.add("show");
-        }
-      });
+      speak().then(r => { if (r !== "started") problem(r); });
     };
     document.addEventListener("click", armed, true);
     document.addEventListener("keydown", armed, true);
@@ -1886,20 +1915,27 @@ const Brief = (function(){
   async function autoStart(){
     const day = nowMYT().day;
     let last = null;
-    try { last = localStorage.getItem("cwh.briefDay"); } catch(e) {}
+    try { last = localStorage.getItem(DONE_KEY); } catch(e) {}
     if (last === String(day)) return;
     await wait(() => Store.state() !== "loading", 4000);
     const pref = Store.all().prefs;
-    if (pref && String(pref.briefDay) === String(day)){ try { localStorage.setItem("cwh.briefDay", String(day)); } catch(e) {} return; }
+    if (pref && String(pref.spokenDay) === String(day)){ try { localStorage.setItem(DONE_KEY, String(day)); } catch(e) {} return; }
     await wait(() => ttsReady, 4000);
-    if (autoDone) return;
-    const ok = await speak();
-    if (ok) markDone(day); else arm(day);
+    pendingDay = day;
+    const ua = navigator.userActivation;
+    if (ua && !ua.hasBeenActive){ arm(); return; }
+    const r = await speak(4000);
+    if (r !== "started" && pendingDay !== null) arm();
+  }
+  function playNow(){
+    disarm();
+    if (speaking){ stop(); return; }
+    speak().then(r => { if (r !== "started") problem(r); });
   }
   function wire(){
-    $("#b-play").addEventListener("click", () => { if (speaking) stop(); else speak(); });
+    $("#b-play").addEventListener("click", playNow);
+    $("#brief-open").addEventListener("click", () => { if (speaking) stop(); playNow(); });
     $("#b-x").addEventListener("click", () => { stop(); clearTimeout(hideTimer); card().classList.remove("show"); });
-    $("#brief-open").addEventListener("click", () => { disarm(); speak().then(ok => { if (ok && !autoDone) markDone(nowMYT().day); }); });
     document.addEventListener("keydown", e => { if (e.key === "Escape" && card().classList.contains("show")){ stop(); card().classList.remove("show"); } });
   }
   return {init, wire, autoStart};
