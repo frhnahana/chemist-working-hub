@@ -1,0 +1,14 @@
+# Render Blueprint for Chemist Working Hub (a static site: no server, no build step)
+services:
+  - type: web
+    name: chemist-working-hub
+    runtime: static
+    buildCommand: echo "No build step needed"
+    staticPublishPath: .
+    headers:
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: strict-origin-when-cross-origin
